@@ -1,0 +1,117 @@
+name: Deploy Southgate to Teranorth FTP
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      TERANORTH_FTP_SERVER: ${{ secrets.TERANORTH_FTP_SERVER }}
+      TERANORTH_FTP_PORT: ${{ secrets.TERANORTH_FTP_PORT }}
+      TERANORTH_FTP_USERNAME: ${{ secrets.TERANORTH_FTP_USERNAME }}
+      TERANORTH_FTP_PASSWORD: ${{ secrets.TERANORTH_FTP_PASSWORD }}
+      TERANORTH_FTP_REMOTE_PATH: ${{ secrets.TERANORTH_FTP_REMOTE_PATH }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate Southgate FTP destination
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -z "${TERANORTH_FTP_SERVER:-}" ] || \
+             [ -z "${TERANORTH_FTP_USERNAME:-}" ] || \
+             [ -z "${TERANORTH_FTP_PASSWORD:-}" ] || \
+             [ -z "${TERANORTH_FTP_REMOTE_PATH:-}" ]; then
+            echo "Missing one or more TERANORTH_* secrets."
+            exit 1
+          fi
+
+          REMOTE_PATH="${TERANORTH_FTP_REMOTE_PATH%/}"
+
+          if [ -z "$REMOTE_PATH" ] || [ "$REMOTE_PATH" = "/" ]; then
+            echo "TERANORTH_FTP_REMOTE_PATH is empty or points to the server root."
+            exit 1
+          fi
+
+          case "$REMOTE_PATH" in
+            */southgate|southgate)
+              ;;
+            *)
+              echo "TERANORTH_FTP_REMOTE_PATH must end with /southgate or /southgate/ for safety."
+              exit 1
+              ;;
+          esac
+
+          echo "Validated FTP target: ${TERANORTH_FTP_REMOTE_PATH}"
+
+      - name: Prepare website upload set
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          DEPLOY_DIR="${RUNNER_TEMP}/southgate-deploy"
+
+          rm -rf "$DEPLOY_DIR"
+          mkdir -p "$DEPLOY_DIR"
+
+          rsync -a --prune-empty-dirs \
+            --exclude='.git/' \
+            --exclude='.github/' \
+            --exclude='.gitignore' \
+            --exclude='.DS_Store' \
+            --exclude='node_modules/' \
+            --exclude='package-lock.json' \
+            --exclude='package.json' \
+            --exclude='vite.config.*' \
+            --exclude='webpack.config.*' \
+            --exclude='README*' \
+            --exclude='*.md' \
+            --exclude='*.yml' \
+            --exclude='*.yaml' \
+            ./ "$DEPLOY_DIR/"
+
+          if [ -z "$(find "$DEPLOY_DIR" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+            echo "No public website files were found to deploy."
+            exit 1
+          fi
+
+          echo "DEPLOY_DIR=$DEPLOY_DIR" >> "$GITHUB_ENV"
+
+      - name: Upload to Teranorth FTP
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          FTP_PORT="${TERANORTH_FTP_PORT:-21}"
+
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq lftp >/dev/null
+
+          lftp -e "
+            set ftp:ssl-allow false
+            set net:max-retries 2
+            set net:timeout 20
+
+            open -p ${FTP_PORT} ${TERANORTH_FTP_SERVER}
+            user ${TERANORTH_FTP_USERNAME} ${TERANORTH_FTP_PASSWORD}
+
+            set ftp:passive-mode true
+
+            mkdir -p ${TERANORTH_FTP_REMOTE_PATH}
+            cd ${TERANORTH_FTP_REMOTE_PATH}
+
+            lcd ${DEPLOY_DIR}
+
+            mirror -R --no-empty-dirs -v . .
+
+            bye
+          "
