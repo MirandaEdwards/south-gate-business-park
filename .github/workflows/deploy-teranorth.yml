@@ -9,7 +9,7 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     env:
       TERANORTH_FTP_SERVER: ${{ secrets.TERANORTH_FTP_SERVER }}
@@ -54,7 +54,7 @@ jobs:
               echo "Southgate destination validated."
               ;;
             *)
-              echo "ERROR: FTP destination must end in /southgate."
+              echo "ERROR: FTP destination must end with /southgate."
               exit 1
               ;;
           esac
@@ -65,7 +65,7 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq lftp netcat-openbsd >/dev/null
 
-      - name: Test FTP server connectivity
+      - name: Test FTP control connection
         shell: bash
         run: |
           set -euo pipefail
@@ -76,35 +76,44 @@ jobs:
           getent hosts "$TERANORTH_FTP_SERVER"
 
           echo
-          echo "Testing TCP connection to port ${FTP_PORT}..."
+          echo "Testing TCP port ${FTP_PORT}..."
           nc -vz -w 15 "$TERANORTH_FTP_SERVER" "$FTP_PORT"
 
           echo
-          echo "FTP server is reachable."
+          echo "FTP control port is reachable."
 
-      - name: Test FTP login and Southgate directory
+      - name: Test FTP login and passive data connection
         shell: bash
         run: |
           set -euo pipefail
 
           FTP_PORT="${TERANORTH_FTP_PORT:-21}"
 
-          lftp -u "${TERANORTH_FTP_USERNAME},${TERANORTH_FTP_PASSWORD}" \
+          lftp \
+            -u "${TERANORTH_FTP_USERNAME},${TERANORTH_FTP_PASSWORD}" \
             "ftp://${TERANORTH_FTP_SERVER}:${FTP_PORT}" <<EOF
           set ftp:ssl-allow false
           set ftp:passive-mode true
-          set net:max-retries 1
-          set net:timeout 20
+          set ftp:prefer-epsv false
+
+          set net:max-retries 2
+          set net:timeout 30
+          set net:reconnect-interval-base 5
+          set xfer:timeout 60
           set cmd:fail-exit true
 
           echo "FTP login successful."
-          pwd
 
           cd "${TERANORTH_FTP_REMOTE_PATH}"
 
           echo "Southgate directory accessible."
+
           pwd
+
+          echo "Testing passive FTP data connection with directory listing..."
           cls -1
+
+          echo "Passive FTP data connection successful."
 
           bye
           EOF
@@ -138,8 +147,8 @@ jobs:
             exit 1
           fi
 
-          echo "Files prepared for deployment:"
-          find "$DEPLOY_DIR" -maxdepth 2 -type f | sort
+          echo "Website files prepared:"
+          find "$DEPLOY_DIR" -type f | sort
 
           echo "DEPLOY_DIR=$DEPLOY_DIR" >> "$GITHUB_ENV"
 
@@ -150,21 +159,67 @@ jobs:
 
           FTP_PORT="${TERANORTH_FTP_PORT:-21}"
 
-          lftp -u "${TERANORTH_FTP_USERNAME},${TERANORTH_FTP_PASSWORD}" \
+          lftp \
+            -u "${TERANORTH_FTP_USERNAME},${TERANORTH_FTP_PASSWORD}" \
             "ftp://${TERANORTH_FTP_SERVER}:${FTP_PORT}" <<EOF
           set ftp:ssl-allow false
+
+          # Use passive FTP, but prefer traditional PASV over EPSV.
           set ftp:passive-mode true
-          set net:max-retries 2
+          set ftp:prefer-epsv false
+
+          # Keep transfers sequential while troubleshooting the firewall.
+          set mirror:parallel-transfer-count 1
+          set mirror:parallel-directories false
+
+          # Don't attempt to reproduce Unix permissions on the web server.
+          set mirror:set-permissions false
+
+          # Give individual data connections a little more tolerance.
+          set net:max-retries 3
           set net:timeout 30
+          set net:reconnect-interval-base 5
+          set xfer:timeout 120
           set cmd:fail-exit true
 
           cd "${TERANORTH_FTP_REMOTE_PATH}"
           lcd "${DEPLOY_DIR}"
 
-          mirror --reverse \
-                 --verbose \
-                 --no-empty-dirs \
-                 . .
+          echo "Beginning Southgate upload..."
+
+          mirror \
+            --reverse \
+            --verbose \
+            --parallel=1 \
+            --no-empty-dirs \
+            . .
+
+          echo "Upload completed."
+
+          bye
+          EOF
+
+      - name: Verify remote site
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          FTP_PORT="${TERANORTH_FTP_PORT:-21}"
+
+          lftp \
+            -u "${TERANORTH_FTP_USERNAME},${TERANORTH_FTP_PASSWORD}" \
+            "ftp://${TERANORTH_FTP_SERVER}:${FTP_PORT}" <<EOF
+          set ftp:ssl-allow false
+          set ftp:passive-mode true
+          set ftp:prefer-epsv false
+          set net:max-retries 2
+          set net:timeout 30
+          set cmd:fail-exit true
+
+          cd "${TERANORTH_FTP_REMOTE_PATH}"
+
+          echo "Remote Southgate directory after deployment:"
+          cls -1
 
           bye
           EOF
