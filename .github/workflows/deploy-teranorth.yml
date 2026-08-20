@@ -1,15 +1,12 @@
-name: Deploy Southgate to Teranorth FTP
+name: Debug Southgate FTP
 
 on:
-  push:
-    branches:
-      - main
   workflow_dispatch:
 
 jobs:
-  deploy:
+  debug-ftp:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
 
     env:
       TERANORTH_FTP_SERVER: ${{ secrets.TERANORTH_FTP_SERVER }}
@@ -19,33 +16,15 @@ jobs:
       TERANORTH_FTP_REMOTE_PATH: ${{ secrets.TERANORTH_FTP_REMOTE_PATH }}
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
       - name: Validate settings
         shell: bash
         run: |
           set -euo pipefail
 
-          if [ -z "${TERANORTH_FTP_SERVER:-}" ]; then
-            echo "TERANORTH_FTP_SERVER is missing."
-            exit 1
-          fi
-
-          if [ -z "${TERANORTH_FTP_USERNAME:-}" ]; then
-            echo "TERANORTH_FTP_USERNAME is missing."
-            exit 1
-          fi
-
-          if [ -z "${TERANORTH_FTP_PASSWORD:-}" ]; then
-            echo "TERANORTH_FTP_PASSWORD is missing."
-            exit 1
-          fi
-
-          if [ -z "${TERANORTH_FTP_REMOTE_PATH:-}" ]; then
-            echo "TERANORTH_FTP_REMOTE_PATH is missing."
-            exit 1
-          fi
+          : "${TERANORTH_FTP_SERVER:?Missing TERANORTH_FTP_SERVER}"
+          : "${TERANORTH_FTP_USERNAME:?Missing TERANORTH_FTP_USERNAME}"
+          : "${TERANORTH_FTP_PASSWORD:?Missing TERANORTH_FTP_PASSWORD}"
+          : "${TERANORTH_FTP_REMOTE_PATH:?Missing TERANORTH_FTP_REMOTE_PATH}"
 
           REMOTE_PATH="${TERANORTH_FTP_REMOTE_PATH%/}"
 
@@ -54,35 +33,52 @@ jobs:
               echo "Southgate destination validated."
               ;;
             *)
-              echo "ERROR: FTP destination must end with /southgate."
+              echo "ERROR: Remote path must end in /southgate."
               exit 1
               ;;
           esac
 
-      - name: Install FTP tools
+      - name: Install diagnostic tools
         shell: bash
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq lftp netcat-openbsd >/dev/null
 
-      - name: Test FTP control connection
+          echo "lftp version:"
+          lftp --version | head -1
+
+      - name: Test FTP control port
         shell: bash
         run: |
           set -euo pipefail
 
           FTP_PORT="${TERANORTH_FTP_PORT:-21}"
 
-          echo "Resolving FTP server..."
+          echo "Resolving server..."
           getent hosts "$TERANORTH_FTP_SERVER"
 
           echo
-          echo "Testing TCP port ${FTP_PORT}..."
+          echo "Testing FTP control port..."
           nc -vz -w 15 "$TERANORTH_FTP_SERVER" "$FTP_PORT"
 
-          echo
-          echo "FTP control port is reachable."
+      - name: Create tiny diagnostic files
+        shell: bash
+        run: |
+          set -euo pipefail
 
-      - name: Test FTP login and passive data connection
+          DEBUG_DIR="${RUNNER_TEMP}/ftp-debug"
+          mkdir -p "$DEBUG_DIR"
+
+          for i in 1 2 3 4 5 6 7 8; do
+            printf 'GitHub FTP diagnostic file %s\n%s\n' \
+              "$i" \
+              "$(date -u --iso-8601=seconds)" \
+              > "$DEBUG_DIR/github-ftp-debug-${i}.txt"
+          done
+
+          echo "DEBUG_DIR=$DEBUG_DIR" >> "$GITHUB_ENV"
+
+      - name: Repeated passive FTP listings
         shell: bash
         run: |
           set -euo pipefail
@@ -92,139 +88,131 @@ jobs:
           lftp \
             -u "${TERANORTH_FTP_USERNAME},${TERANORTH_FTP_PASSWORD}" \
             "ftp://${TERANORTH_FTP_SERVER}:${FTP_PORT}" <<EOF
+
+          # Show FTP protocol traffic including PASV responses.
+          debug 6
+
           set ftp:ssl-allow false
           set ftp:passive-mode true
           set ftp:prefer-epsv false
 
-          set net:max-retries 2
-          set net:timeout 30
-          set net:reconnect-interval-base 5
-          set xfer:timeout 60
+          set net:max-retries 1
+          set net:timeout 20
+          set xfer:timeout 30
           set cmd:fail-exit true
-
-          echo "FTP login successful."
 
           cd "${TERANORTH_FTP_REMOTE_PATH}"
 
-          echo "Southgate directory accessible."
-
-          pwd
-
-          echo "Testing passive FTP data connection with directory listing..."
+          echo "===== LISTING 1 ====="
           cls -1
 
-          echo "Passive FTP data connection successful."
+          echo "===== LISTING 2 ====="
+          cls -1
 
-          bye
-          EOF
+          echo "===== LISTING 3 ====="
+          cls -1
 
-      - name: Prepare website files
-        shell: bash
-        run: |
-          set -euo pipefail
+          echo "===== LISTING 4 ====="
+          cls -1
 
-          DEPLOY_DIR="${RUNNER_TEMP}/southgate-deploy"
-
-          rm -rf "$DEPLOY_DIR"
-          mkdir -p "$DEPLOY_DIR"
-
-          rsync -a --prune-empty-dirs \
-            --exclude='.git/' \
-            --exclude='.github/' \
-            --exclude='.gitignore' \
-            --exclude='.DS_Store' \
-            --exclude='node_modules/' \
-            --exclude='package.json' \
-            --exclude='package-lock.json' \
-            --exclude='README*' \
-            --exclude='*.md' \
-            --exclude='*.yml' \
-            --exclude='*.yaml' \
-            ./ "$DEPLOY_DIR/"
-
-          if [ -z "$(find "$DEPLOY_DIR" -mindepth 1 -print -quit)" ]; then
-            echo "No website files were found."
-            exit 1
-          fi
-
-          echo "Website files prepared:"
-          find "$DEPLOY_DIR" -type f | sort
-
-          echo "DEPLOY_DIR=$DEPLOY_DIR" >> "$GITHUB_ENV"
-
-      - name: Upload website to Southgate
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          FTP_PORT="${TERANORTH_FTP_PORT:-21}"
-
-          lftp \
-            -u "${TERANORTH_FTP_USERNAME},${TERANORTH_FTP_PASSWORD}" \
-            "ftp://${TERANORTH_FTP_SERVER}:${FTP_PORT}" <<EOF
-          set ftp:ssl-allow false
-
-          # Use passive FTP, but prefer traditional PASV over EPSV.
-          set ftp:passive-mode true
-          set ftp:prefer-epsv false
-
-          # Keep transfers sequential while troubleshooting the firewall.
-          set mirror:parallel-transfer-count 1
-          set mirror:parallel-directories false
-
-          # Don't attempt to reproduce Unix permissions on the web server.
-          set mirror:set-permissions false
-
-          # Give individual data connections a little more tolerance.
-          set net:max-retries 3
-          set net:timeout 30
-          set net:reconnect-interval-base 5
-          set xfer:timeout 120
-          set cmd:fail-exit true
-
-          cd "${TERANORTH_FTP_REMOTE_PATH}"
-          lcd "${DEPLOY_DIR}"
-
-          echo "Beginning Southgate upload..."
-
-          mirror \
-            --reverse \
-            --verbose \
-            --parallel=1 \
-            --no-empty-dirs \
-            . .
-
-          echo "Upload completed."
-
-          bye
-          EOF
-
-      - name: Verify remote site
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          FTP_PORT="${TERANORTH_FTP_PORT:-21}"
-
-          lftp \
-            -u "${TERANORTH_FTP_USERNAME},${TERANORTH_FTP_PASSWORD}" \
-            "ftp://${TERANORTH_FTP_SERVER}:${FTP_PORT}" <<EOF
-          set ftp:ssl-allow false
-          set ftp:passive-mode true
-          set ftp:prefer-epsv false
-          set net:max-retries 2
-          set net:timeout 30
-          set cmd:fail-exit true
-
-          cd "${TERANORTH_FTP_REMOTE_PATH}"
-
-          echo "Remote Southgate directory after deployment:"
+          echo "===== LISTING 5 ====="
           cls -1
 
           bye
           EOF
 
-      - name: Deployment complete
+      - name: Upload tiny files using normal PASV behavior
         shell: bash
         run: |
-          echo "Southgate FTP deployment completed successfully."
+          set -euo pipefail
+
+          FTP_PORT="${TERANORTH_FTP_PORT:-21}"
+
+          echo "Testing repeated tiny uploads."
+          echo "Watch the log for PASV responses immediately before a failed transfer."
+
+          lftp \
+            -u "${TERANORTH_FTP_USERNAME},${TERANORTH_FTP_PASSWORD}" \
+            "ftp://${TERANORTH_FTP_SERVER}:${FTP_PORT}" <<EOF
+
+          debug 6
+
+          set ftp:ssl-allow false
+          set ftp:passive-mode true
+          set ftp:prefer-epsv false
+
+          set net:max-retries 1
+          set net:timeout 20
+          set xfer:timeout 30
+          set cmd:fail-exit true
+
+          cd "${TERANORTH_FTP_REMOTE_PATH}"
+          lcd "${DEBUG_DIR}"
+
+          echo "===== UPLOAD 1 ====="
+          put github-ftp-debug-1.txt
+
+          echo "===== UPLOAD 2 ====="
+          put github-ftp-debug-2.txt
+
+          echo "===== UPLOAD 3 ====="
+          put github-ftp-debug-3.txt
+
+          echo "===== UPLOAD 4 ====="
+          put github-ftp-debug-4.txt
+
+          echo "===== UPLOAD 5 ====="
+          put github-ftp-debug-5.txt
+
+          echo "===== UPLOAD 6 ====="
+          put github-ftp-debug-6.txt
+
+          echo "===== UPLOAD 7 ====="
+          put github-ftp-debug-7.txt
+
+          echo "===== UPLOAD 8 ====="
+          put github-ftp-debug-8.txt
+
+          bye
+          EOF
+
+      - name: Test PASV while ignoring advertised PASV IP
+        if: failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          FTP_PORT="${TERANORTH_FTP_PORT:-21}"
+
+          echo "Previous upload failed."
+          echo "Testing again while ignoring the IP address supplied in PASV responses."
+          echo "If this succeeds, the FTP server may be advertising an incorrect PASV IP."
+
+          lftp \
+            -u "${TERANORTH_FTP_USERNAME},${TERANORTH_FTP_PASSWORD}" \
+            "ftp://${TERANORTH_FTP_SERVER}:${FTP_PORT}" <<EOF
+
+          debug 6
+
+          set ftp:ssl-allow false
+          set ftp:passive-mode true
+          set ftp:prefer-epsv false
+
+          # Diagnostic for FTP servers behind broken NAT/firewall configurations.
+          set ftp:ignore-pasv-address true
+
+          set net:max-retries 1
+          set net:timeout 20
+          set xfer:timeout 30
+          set cmd:fail-exit true
+
+          cd "${TERANORTH_FTP_REMOTE_PATH}"
+          lcd "${DEBUG_DIR}"
+
+          echo "===== IGNORE-PASV-ADDRESS TEST ====="
+          put github-ftp-debug-8.txt -o github-ftp-debug-ignore-pasv.txt
+
+          echo "IGNORE-PASV-ADDRESS TEST SUCCEEDED"
+
+          bye
+          EOF
